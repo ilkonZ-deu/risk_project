@@ -1,0 +1,19 @@
+# Risk project — окружение для project.ipynb и risk_utils.py
+# Рекомендуется Python 3.10+
+# PyTorch, torch и пакеты nvidia-* в проект не входят и сюда не добавляются.
+
+pandas>=3.0,<4
+numpy>=1.26.0
+scipy>=1.11.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+statsmodels>=0.14.0
+openpyxl>=3.1.0
+requests>=2.31.0
+
+# Для работы с ноутбуком
+jupyter>=1.0.0
+ipykernel>=6.25.0
+
+# Опционально: ускорение бонусных ячеек (Монте-Карло)
+joblib>=1.3.0
