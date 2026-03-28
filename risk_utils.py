@@ -82,6 +82,343 @@ def portfolio_sharpe(weights, mu, cov):
     return ret / vol if vol > 0 else 0
 from scipy.optimize import minimize
 
+
+def efficient_frontier_unconstrained(mu_vec, cov_mat, n_points=80):
+    """
+    Граница минимальной дисперсии при целевой доходности без ограничений на веса
+    (короткие продажи разрешены, sum w = 1). Возвращает (vols, rets) или (None, None).
+    """
+    mu_vec = np.asarray(mu_vec, dtype=float).ravel()
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    n = len(mu_vec)
+    x0 = np.ones(n) / n
+    constraints_sum = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
+
+    res_min = minimize(
+        lambda w: portfolio_volatility(w, cov_mat),
+        x0,
+        constraints=constraints_sum,
+        method='SLSQP',
+        options={'maxiter': 500, 'ftol': 1e-10},
+    )
+    if not res_min.success:
+        return None, None
+    ret_min = portfolio_return(res_min.x, mu_vec)
+    ret_max = float(np.max(mu_vec)) * 1.5
+    target_rets = np.linspace(ret_min, ret_max, n_points)
+    vols, rets = [], []
+    for target in target_rets:
+        cons = [
+            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
+            {'type': 'eq', 'fun': lambda w, tr=target: portfolio_return(w, mu_vec) - tr},
+        ]
+        res = minimize(
+            lambda w: portfolio_volatility(w, cov_mat),
+            x0,
+            constraints=cons,
+            method='SLSQP',
+            options={'maxiter': 500, 'ftol': 1e-10},
+        )
+        if res.success:
+            vols.append(portfolio_volatility(res.x, cov_mat))
+            rets.append(portfolio_return(res.x, mu_vec))
+    return np.array(vols), np.array(rets)
+
+
+def maximum_variance_frontier_long_only(mu_vec, cov_mat, n_points=80):
+    """
+    Верхняя граница (максимальная дисперсия) при целевой доходности, long-only:
+    w >= 0, sum w = 1. Возвращает (vols, rets, weights) — массивы или пустые списки при сбое.
+    """
+    mu_vec = np.asarray(mu_vec, dtype=float).ravel()
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    n = len(mu_vec)
+    x0 = np.ones(n) / n
+    bounds = [(0.0, None) for _ in range(n)]
+    target_rets = np.linspace(float(np.min(mu_vec)), float(np.max(mu_vec)), n_points)
+    vols, rets, weights = [], [], []
+    for target in target_rets:
+        cons = [
+            {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0},
+            {'type': 'eq', 'fun': lambda w, tr=target: portfolio_return(w, mu_vec) - tr},
+        ]
+        res = minimize(
+            lambda w: -portfolio_volatility(w, cov_mat),
+            x0,
+            bounds=bounds,
+            constraints=cons,
+            method='SLSQP',
+            options={'maxiter': 500, 'ftol': 1e-9},
+        )
+        if res.success:
+            w = res.x
+            vols.append(portfolio_volatility(w, cov_mat))
+            rets.append(portfolio_return(w, mu_vec))
+            weights.append(w.copy())
+            x0 = w.copy()
+    if not vols:
+        return np.array([]), np.array([]), []
+    return np.array(vols), np.array(rets), weights
+
+
+def _random_feasible_wu(rng, n, gross_leverage):
+    """Случайное (w, u): sum w=1, sum u <= L, u_i >= |w_i|."""
+    L = float(gross_leverage)
+    w = rng.random(n)
+    w = w / np.sum(w)
+    u = np.abs(w) + rng.random(n) * 0.05 + 1e-4
+    u = np.maximum(u, np.abs(w))
+    if np.sum(u) > L:
+        u = u * (L / np.sum(u))
+    return np.concatenate([w, u])
+
+
+def maximum_variance_frontier_gross_leverage(
+    mu_vec, cov_mat, gross_leverage=2.0, n_points=80, n_starts=2, rng=None
+):
+    """
+    Максимизация дисперсии при целевой доходности с разрешёнными шортами и ограничением
+    валовой экспозиции sum_i |w_i| <= gross_leverage. Вспомогательные u_i >= |w_i|:
+    sum u <= L, u_i - w_i >= 0, u_i + w_i >= 0. Также sum w = 1, w'mu = r.
+
+    Возвращает (vols, rets, weights_list). При неуспехе всех стартов точка пропускается.
+    """
+    mu_vec = np.asarray(mu_vec, dtype=float).ravel()
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    n = len(mu_vec)
+    L = float(gross_leverage)
+    if L < 1.0:
+        raise ValueError('gross_leverage must be >= 1 (need at least sum|w| >= |sum w| = 1)')
+    rng = np.random.default_rng(42) if rng is None else rng
+
+    def w_from_z(z):
+        return z[:n]
+
+    def neg_var(z):
+        w = w_from_z(z)
+        return -float(w @ cov_mat @ w)
+
+    def make_constraints(target_r):
+        return [
+            {'type': 'eq', 'fun': lambda z, tr=target_r: np.sum(z[:n]) - 1.0},
+            {'type': 'eq', 'fun': lambda z, tr=target_r: portfolio_return(w_from_z(z), mu_vec) - tr},
+            {'type': 'ineq', 'fun': lambda z: L - np.sum(z[n:])},
+            {'type': 'ineq', 'fun': lambda z: z[n:] - z[:n]},
+            {'type': 'ineq', 'fun': lambda z: z[n:] + z[:n]},
+        ]
+
+    bounds = [(None, None)] * n + [(0.0, None)] * n
+    target_rets = np.linspace(float(np.min(mu_vec)), float(np.max(mu_vec)), n_points)
+    vols, rets, weights = [], [], []
+
+    w0 = np.ones(n) / n
+    u0 = np.abs(w0) + 1e-4
+    if np.sum(u0) > L:
+        u0 = u0 * (L / np.sum(u0))
+    x0_det = np.concatenate([w0, u0])
+
+    for target in target_rets:
+        best_w = None
+        best_var = -np.inf
+        starts = [x0_det.copy()]
+        for _ in range(max(0, n_starts - 1)):
+            starts.append(_random_feasible_wu(rng, n, L))
+
+        for x0 in starts:
+            res = minimize(
+                neg_var,
+                x0,
+                bounds=bounds,
+                constraints=make_constraints(target),
+                method='SLSQP',
+                options={'maxiter': 400, 'ftol': 1e-7},
+            )
+            if res.success:
+                w = w_from_z(res.x)
+                v = float(w @ cov_mat @ w)
+                if v > best_var:
+                    best_var = v
+                    best_w = w
+        if best_w is not None:
+            vols.append(np.sqrt(max(best_var, 0.0)))
+            rets.append(portfolio_return(best_w, mu_vec))
+            weights.append(best_w.copy())
+            u_new = np.maximum(np.abs(best_w), 1e-8)
+            if np.sum(u_new) > L:
+                u_new = u_new * (L / np.sum(u_new))
+            x0_det = np.concatenate([best_w, u_new])
+
+    if not vols:
+        return np.array([]), np.array([]), []
+    return np.array(vols), np.array(rets), weights
+
+
+def adv_dollar_proxy_from_volatility(cov_mat, median_scale=0.05):
+    """
+    Прокси среднего дневного объёма в долях капитала: из волатильностей sqrt(diag Sigma).
+    Выше sigma_i — ниже относительная «глубина», ADV масштабируется медианой.
+    """
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    sig = np.sqrt(np.maximum(np.diag(cov_mat), 1e-18))
+    inv = 1.0 / (sig + 1e-8)
+    med = np.median(inv)
+    if med <= 0:
+        med = 1.0
+    adv = inv / med * float(median_scale)
+    return adv
+
+
+def expected_execution_impact_ac(
+    w,
+    w_prev,
+    cov_mat,
+    adv_dollar=None,
+    alpha=0.5,
+    eta_temp=1.0,
+    eta_perm=0.25,
+    linear_bps=5.0,
+    notional=1.0,
+    participation_cap=1.0,
+    eps=1e-12,
+):
+    """
+    Reduced-form Almgren–Chriss / square-root: temporary ~ participation**alpha,
+    permanent ~ participation, participation_i = |dw_i|*notional / ADV_i.
+    Без ADV — см. adv_dollar_proxy_from_volatility.
+    Возвращает (total, detail dict).
+    """
+    w = np.asarray(w, dtype=float).ravel()
+    w_prev = np.asarray(w_prev, dtype=float).ravel()
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    if len(w) != len(w_prev):
+        raise ValueError('w and w_prev must have same length')
+    dw = np.abs(w - w_prev) * float(notional)
+    n = len(w)
+    if adv_dollar is None:
+        adv = adv_dollar_proxy_from_volatility(cov_mat)
+    else:
+        adv = np.asarray(adv_dollar, dtype=float).ravel()
+        if len(adv) != n:
+            raise ValueError('adv_dollar length must match w')
+    part = dw / (adv + eps)
+    part = np.minimum(part, float(participation_cap))
+    temporary = float(eta_temp * np.sum(np.power(part, alpha)))
+    permanent = float(eta_perm * np.sum(part))
+    linear = float(linear_bps * 1e-4 * np.sum(dw))
+    total = temporary + permanent + linear
+    return total, {
+        'temporary': temporary,
+        'permanent': permanent,
+        'linear_fee': linear,
+        'participation': part,
+        'adv_used': adv,
+    }
+
+
+def delay_opportunity_variance_proxy(w, w_prev, cov_mat):
+    """Прокси риска задержки: (w-w_prev)' Sigma (w-w_prev)."""
+    d = np.asarray(w, dtype=float).ravel() - np.asarray(w_prev, dtype=float).ravel()
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    return float(d @ cov_mat @ d)
+
+
+def total_is_penalty_for_optimizer(
+    w,
+    w_prev,
+    cov_mat,
+    adv_dollar=None,
+    lambda_delay=0.0,
+    **impact_kw,
+):
+    """
+    Полная phi(w): AC-издержки + опционально lambda_delay * (w-w_prev)'Sigma(w-w_prev).
+    """
+    phi_imp, detail = expected_execution_impact_ac(
+        w, w_prev, cov_mat, adv_dollar=adv_dollar, **impact_kw
+    )
+    delay_v = delay_opportunity_variance_proxy(w, w_prev, cov_mat)
+    delay_term = float(lambda_delay) * delay_v
+    total = phi_imp + delay_term
+    detail = dict(detail)
+    detail['delay_variance'] = delay_v
+    detail['delay_penalty'] = delay_term
+    detail['total_phi'] = total
+    return total, detail
+
+
+def neg_utility_mean_variance_is(
+    w,
+    mu,
+    cov_mat,
+    w_prev,
+    lambda_risk,
+    lambda_is,
+    adv_dollar=None,
+    lambda_delay=0.05,
+    **impact_kw,
+):
+    """Минимизировать: -(mu'w - lambda_risk w'Sw - lambda_is * phi)."""
+    phi, _ = total_is_penalty_for_optimizer(
+        w, w_prev, cov_mat, adv_dollar=adv_dollar, lambda_delay=lambda_delay, **impact_kw
+    )
+    ret = portfolio_return(w, mu)
+    risk = float(w @ np.asarray(cov_mat, dtype=float) @ w)
+    return -(ret - float(lambda_risk) * risk - float(lambda_is) * phi)
+
+
+def optimize_mean_variance_is(
+    mu_vec,
+    cov_mat,
+    w_prev,
+    lambda_risk=1.0,
+    lambda_is=0.5,
+    adv_dollar=None,
+    lambda_delay=0.05,
+    bounds=None,
+    cons=None,
+    x0=None,
+    **impact_kw,
+):
+    """
+    Максимизирует mu'w - lambda_risk w'Sw - lambda_is phi(w) при ограничениях (по умолчанию sum w = 1).
+    """
+    mu_vec = np.asarray(mu_vec, dtype=float).ravel()
+    cov_mat = np.asarray(cov_mat, dtype=float)
+    n = len(mu_vec)
+    w_prev = np.asarray(w_prev, dtype=float).ravel()
+    if len(w_prev) != n:
+        raise ValueError('w_prev length must match mu_vec')
+    if x0 is None:
+        x0 = np.ones(n) / n
+    if bounds is None:
+        bounds = [(None, None)] * n
+    if cons is None:
+        cons = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
+
+    def obj(w):
+        return neg_utility_mean_variance_is(
+            w,
+            mu_vec,
+            cov_mat,
+            w_prev,
+            lambda_risk,
+            lambda_is,
+            adv_dollar=adv_dollar,
+            lambda_delay=lambda_delay,
+            **impact_kw,
+        )
+
+    res = minimize(
+        obj,
+        x0,
+        bounds=bounds,
+        constraints=cons,
+        method='SLSQP',
+        options={'maxiter': 900, 'ftol': 1e-9},
+    )
+    return res
+
+
 def find_effective_frontier(df_returns: pd.DataFrame, start_month: str, end_month: str, cov_method: Literal['historical', 'beta_historical', 'beta_adjusted']):
     mu = df_returns.loc[start_month:end_month].mean(axis=0)
     mu = mu.values
@@ -156,18 +493,55 @@ def load_all_tickers(tickers, start_date, end_date):
     result = pd.concat(frames, ignore_index=True)
     return result
 
+
+def get_moex_index_candles(ticker, start='2015-01-01', end='2025-12-31', session=None):
+    """
+    Дневные свечи индекса (IMOEX, MCFTR и т.д.) через ISS MOEX API.
+    """
+    if session is None:
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'risk_utils/1.0'})
+    url = f'https://iss.moex.com/iss/engines/stock/markets/index/securities/{ticker}/candles.json'
+    parts = []
+    start_offset = 0
+    while True:
+        params = {'from': start, 'till': end, 'interval': 24, 'start': start_offset}
+        r = session.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        data = j['candles']['data']
+        cols = j['candles']['columns']
+        if not data:
+            break
+        parts.append(pd.DataFrame(data, columns=cols))
+        if len(data) < 100:
+            break
+        start_offset += len(data)
+    if not parts:
+        return pd.DataFrame()
+    result = pd.concat(parts, ignore_index=True)
+    result['begin'] = pd.to_datetime(result['begin'])
+    result = result.set_index('begin')[['close']].rename(columns={'close': ticker})
+    result.index.name = 'date'
+    return result
+
+
 def get_rebalance_dates(index, step='Y'):
     """
     Выбирает даты, на которых считаем mu и Sigma.
-    'Y'  - конец года
-    'Q'  - конец квартала
-    'M'  - конец месяца
+    'Y' / 'YE'  - конец года
+    'Q' / 'QE'  - конец квартала
+    'M' / 'ME'  - конец месяца
     'W'  - конец недели
     'D'  - каждый день
+    Короткие алиасы ('Y','Q','M') приводятся к частотам pandas 2.x ('YE','QE','ME').
     """
     idx = pd.DatetimeIndex(index)
     if step == 'D':
         return idx
+    aliases = {'Y': 'YE', 'Q': 'QE', 'M': 'ME'}
+    if step in aliases:
+        step = aliases[step]
     s = pd.Series(index=idx, data=1)
     dates = s.resample(step).last().dropna().index
     return dates
